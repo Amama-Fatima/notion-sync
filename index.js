@@ -1,6 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const { saveUser, getUserByWorkspace } = require("./src/db/db");
+const WebhookHandler = require("./src/webhooks/handler");
 require("dotenv").config();
 
 const app = express();
