@@ -91,6 +91,37 @@ app.get("/auth/notion/callback", async (req, res) => {
   }
 });
 
+app.post("/webhooks/notion", async (req, res) => {
+  // Respond immediately (Notion requires <3 second response)
+  res.status(200).send("OK");
+
+  // Process webhook asynchronously
+  try {
+    const event = req.body;
+
+    console.log("Webhook received:", JSON.stringify(event, null, 2));
+
+    const workspaceId = "58347295-e899-8147-a5c8-00033e317575";
+
+    const user = await getUserByWorkspace(workspaceId);
+
+    if (!user) {
+      console.error("User not found for webhook");
+      return;
+    }
+
+    // Handle the event
+    const handler = new WebhookHandler(
+      user.notion_access_token,
+      process.env.SUPERMEMORY_API_KEY,
+    );
+
+    await handler.handleEvent(event);
+  } catch (error) {
+    console.error("Webhook processing error:", error);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
