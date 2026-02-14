@@ -91,18 +91,25 @@ app.get("/auth/notion/callback", async (req, res) => {
   }
 });
 
+// Webhook endpoint
 app.post("/webhooks/notion", async (req, res) => {
-  // Respond immediately (Notion requires <3 second response)
+  const event = req.body;
+
+  if (event.verification_token) {
+    console.log("📝 Webhook verification received");
+    console.log("Verification token:", event.verification_token);
+
+    return res.status(200).json({
+      verification_token: event.verification_token,
+    });
+  }
+
   res.status(200).send("OK");
 
-  // Process webhook asynchronously
   try {
-    const event = req.body;
-
     console.log("Webhook received:", JSON.stringify(event, null, 2));
 
     const workspaceId = "58347295-e899-8147-a5c8-00033e317575";
-
     const user = await getUserByWorkspace(workspaceId);
 
     if (!user) {
@@ -110,7 +117,6 @@ app.post("/webhooks/notion", async (req, res) => {
       return;
     }
 
-    // Handle the event
     const handler = new WebhookHandler(
       user.notion_access_token,
       process.env.SUPERMEMORY_API_KEY,
