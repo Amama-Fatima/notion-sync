@@ -13,22 +13,25 @@ class WebhookHandler {
    * @param {Object} event - Webhook event payload
    */
   async handleEvent(event) {
-    const { type, page_id } = event;
+    // Extract page_id from the correct location
+    const pageId = event.entity?.id;
+    const type = event.type;
 
-    console.log(`\n📨 Received webhook: ${type} for page ${page_id}`);
+    console.log(`\n📨 Received webhook: ${type} for page ${pageId}`);
 
     try {
       switch (type) {
         case "page.created":
-          await this.handlePageCreated(page_id);
+          await this.handlePageCreated(pageId);
           break;
 
-        case "page.updated":
-          await this.handlePageUpdated(page_id);
+        case "page.properties_updated":
+        case "page.content_updated":
+          await this.handlePageUpdated(pageId);
           break;
 
         case "page.deleted":
-          await this.handlePageDeleted(page_id);
+          await this.handlePageDeleted(pageId);
           break;
 
         default:
