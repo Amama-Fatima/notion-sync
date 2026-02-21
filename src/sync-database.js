@@ -1,25 +1,39 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "../.env") });
 
-const { getUserByWorkspace, saveDatabase } = require("./db/db");
+const { saveDatabase, pool } = require("./db/db");
 const axios = require("axios");
 const PropertyParser = require("./notion/property-parser");
 const SupermemoryClient = require("./supermemory/client");
 
-async function syncDatabase(databaseId) {
-  const workspaceId = "58347295-e899-8147-a5c8-00033e317575";
-
-  const user = await getUserByWorkspace(workspaceId);
-
-  if (!user) {
-    console.log("❌ User not found");
-    return;
+/**
+ * Find the title property value from a Notion page's properties.
+ * Notion marks exactly one property as type "title" per database.
+ */
+function extractTitle(properties) {
+  for (const [key, value] of Object.entries(properties)) {
+    if (value.type === "title") {
+      return PropertyParser.parseRichText(value.title) || "Untitled";
+    }
   }
+  return "Untitled";
+}
 
-  console.log(`🔄 Starting sync for database: ${databaseId}\n`);
+/**
+ * Sync all pages from a Notion database to Supermemory.
+ *
+ * @param {string} databaseId - Notion database ID
+ * @param {Object} user - User row from DB ({ id, notion_access_token })
+ * @returns {Object} { pagesSynced, errors }
+ */
+async function syncDatabase(databaseId, user) {
+  console.log(`🔄 Starting sync for database: ${databaseId}`);
+
+  // Mark as syncing
+  await setDatabaseStatus(user.id, databaseId, "syncing");
 
   try {
-    // Get database info
+    // Fetch database metadata from Notion
     const dbInfo = await axios.get(
       `https://api.notion.com/v1/databases/${databaseId}`,
       {
@@ -31,12 +45,12 @@ async function syncDatabase(databaseId) {
     );
 
     const databaseName = PropertyParser.parseRichText(dbInfo.data.title);
-    console.log(`📋 Database: ${databaseName}\n`);
+    console.log(`📋 Database: ${databaseName}`);
 
-    // Save database mapping
+    // Upsert database record
     await saveDatabase(user.id, databaseId, databaseName);
 
-    // Query all pages from database
+    // Paginate through all pages
     let hasMore = true;
     let startCursor = undefined;
     let allPages = [];
@@ -44,7 +58,7 @@ async function syncDatabase(databaseId) {
     while (hasMore) {
       const response = await axios.post(
         `https://api.notion.com/v1/databases/${databaseId}/query`,
-        { start_cursor: startCursor },
+        startCursor ? { start_cursor: startCursor } : {},
         {
           headers: {
             Authorization: `Bearer ${user.notion_access_token}`,
@@ -59,28 +73,29 @@ async function syncDatabase(databaseId) {
       startCursor = response.data.next_cursor;
     }
 
-    console.log(`Found ${allPages.length} pages to sync\n`);
+    console.log(`Found ${allPages.length} pages to sync`);
 
-    // Prepare documents for batch add
+    if (allPages.length === 0) {
+      await setDatabaseStatus(user.id, databaseId, "idle", 0);
+      return { pagesSynced: 0, errors: [] };
+    }
+
+    // Build documents for batch add
     const supermemory = new SupermemoryClient(process.env.SUPERMEMORY_API_KEY);
     const documents = [];
 
     for (const page of allPages) {
+      const title = extractTitle(page.properties);
       const metadata = PropertyParser.parse(page.properties);
 
-      // Extract content (title property)
-      const content =
-        metadata["Task name"] ||
-        metadata["Name"] ||
-        metadata["Title"] ||
-        "Untitled";
+      // Remove the title property from metadata — it becomes the content
+      for (const [key, value] of Object.entries(page.properties)) {
+        if (value.type === "title") {
+          delete metadata[key];
+          break;
+        }
+      }
 
-      // Remove title from metadata (it's now content)
-      delete metadata["Task name"];
-      delete metadata["Name"];
-      delete metadata["Title"];
-
-      // Add Notion-specific metadata
       metadata.notionPageId = page.id;
       metadata.notionUrl = page.url;
       metadata.notionDatabaseId = databaseId;
@@ -89,66 +104,76 @@ async function syncDatabase(databaseId) {
       metadata.syncedAt = new Date().toISOString();
 
       documents.push({
-        content: content,
-        metadata: metadata,
+        content: title,
+        metadata,
         customId: page.id,
         containerTag: "notion-sync",
       });
 
-      console.log(`✓ Prepared: "${content}"`);
+      console.log(`  ✓ Prepared: "${title}"`);
     }
 
-    console.log(
-      `\n📤 Batch syncing ${documents.length} documents to Supermemory...\n`,
-    );
-    // Batch add to Supermemory
+    // Batch sync to Supermemory
+    console.log(`\n📤 Syncing ${documents.length} documents to Supermemory...`);
     const batchResponse = await supermemory.batchAddDocuments(documents);
-
-    console.log("Batch response:", JSON.stringify(batchResponse, null, 2));
-
-    // The response has a 'results' array
     const batchResults = batchResponse.results || batchResponse;
 
     if (!batchResults || batchResults.length === 0) {
-      console.log("❌ No results from batch add");
-      process.exit(1);
+      throw new Error("No results returned from Supermemory batch add");
     }
 
-    console.log(`\n✅ Batch created ${batchResults.length} documents`);
-    console.log("⏳ Waiting for processing...\n");
-
-    // Wait for all to process
+    // Wait for processing
+    const errors = [];
     let processed = 0;
+
     for (const result of batchResults) {
       try {
         await supermemory.waitForProcessing(result.id);
         processed++;
         console.log(`  [${processed}/${batchResults.length}] Processed`);
       } catch (error) {
-        console.error(`  ❌ Failed: ${result.id}`);
+        errors.push({ id: result.id, error: error.message });
+        console.error(`  ❌ Failed: ${result.id} — ${error.message}`);
       }
     }
-    console.log(
-      `\n🎉 Sync complete! ${processed}/${allPages.length} pages synced successfully`,
+
+    // Update DB: last synced timestamp, page count, status
+    await pool.query(
+      `UPDATE databases
+       SET last_synced_at = NOW(),
+           pages_synced = $1,
+           sync_status = 'idle'
+       WHERE user_id = $2 AND notion_database_id = $3`,
+      [processed, user.id, databaseId],
     );
 
-    // Update last synced timestamp
-    await updateLastSynced(user.id, databaseId);
-  } catch (error) {
-    console.error("❌ Sync failed:", error.response?.data || error.message);
-  }
+    console.log(
+      `\n🎉 Sync complete! ${processed}/${allPages.length} pages synced`,
+    );
 
-  process.exit(0);
+    return { pagesSynced: processed, errors };
+  } catch (error) {
+    await setDatabaseStatus(user.id, databaseId, "error");
+    console.error("❌ Sync failed:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
-async function updateLastSynced(userId, databaseId) {
-  const { pool } = require("./db/db");
+async function setDatabaseStatus(userId, databaseId, status, pagesSynced) {
+  const updates = ["sync_status = $1"];
+  const values = [status, userId, databaseId];
+
+  if (pagesSynced !== undefined) {
+    updates.push("pages_synced = $4");
+    values.splice(1, 0, pagesSynced); // insert before userId
+  }
+
+  // Simpler: just do two queries to avoid dynamic param juggling
   await pool.query(
-    "UPDATE databases SET last_synced_at = NOW() WHERE user_id = $1 AND notion_database_id = $2",
-    [userId, databaseId],
+    `UPDATE databases SET sync_status = $1
+     WHERE user_id = $2 AND notion_database_id = $3`,
+    [status, userId, databaseId],
   );
 }
 
-// Run with Todo List database ID
-const databaseId = "2ed47295-e899-80d4-91a3-e626fc735e65";
-syncDatabase(databaseId);
+module.exports = { syncDatabase };
