@@ -11,6 +11,7 @@ const {
 } = require("./src/db/db");
 const WebhookHandler = require("./src/webhooks/handler");
 const { syncDatabase } = require("./src/sync-database");
+const PropertyParser = require("./src/notion/property-parser");
 require("dotenv").config();
 
 const app = express();
@@ -400,6 +401,111 @@ app.post("/webhooks/notion", async (req, res) => {
     await handler.handleEvent(event);
   } catch (error) {
     console.error("Webhook processing error:", error);
+  }
+});
+
+// ─── Add this route to index.js (before app.listen) ─────────────────────────
+//
+// GET /api/debug/:databaseId
+//
+// Returns the full extracted JSON for every page in the database,
+// exactly as it would be sent to Supermemory. Use this to verify
+// property parsing without actually writing anything.
+//
+// Example: GET /api/debug/2ed47295-e899-80d4-91a3-e626fc735e65
+
+app.get("/api/debug/:databaseId", async (req, res) => {
+  const { databaseId } = req.params;
+
+  const user = await getUser();
+  if (!user) {
+    return res
+      .status(401)
+      .json({ error: "No authorized user. Complete OAuth first." });
+  }
+
+  try {
+    // Fetch database metadata
+    const dbInfo = await axios.get(
+      `https://api.notion.com/v1/databases/${databaseId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${user.notion_access_token}`,
+          "Notion-Version": "2022-06-28",
+        },
+      },
+    );
+
+    const databaseName = PropertyParser.parseRichText(dbInfo.data.title);
+    const schemaProperties = Object.entries(dbInfo.data.properties).map(
+      ([name, prop]) => ({ name, type: prop.type }),
+    );
+
+    // Fetch all pages
+    let hasMore = true;
+    let startCursor = undefined;
+    let allPages = [];
+
+    while (hasMore) {
+      const response = await axios.post(
+        `https://api.notion.com/v1/databases/${databaseId}/query`,
+        startCursor ? { start_cursor: startCursor } : {},
+        {
+          headers: {
+            Authorization: `Bearer ${user.notion_access_token}`,
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+          },
+        },
+      );
+      allPages = allPages.concat(response.data.results);
+      hasMore = response.data.has_more;
+      startCursor = response.data.next_cursor;
+    }
+
+    // Extract each page
+    const extracted = allPages.map((page) => {
+      let title = "Untitled";
+      let titleKey = null;
+
+      for (const [key, value] of Object.entries(page.properties)) {
+        if (value.type === "title") {
+          title = PropertyParser.parseRichText(value.title) || "Untitled";
+          titleKey = key;
+          break;
+        }
+      }
+
+      const metadata = PropertyParser.parse(page.properties);
+      if (titleKey) delete metadata[titleKey];
+
+      metadata.notionPageId = page.id;
+      metadata.notionUrl = page.url;
+      metadata.notionDatabaseId = databaseId;
+      metadata.notionDatabaseName = databaseName;
+      metadata.source = "notion-sync";
+      metadata.syncedAt = new Date().toISOString();
+
+      return {
+        content: title,
+        titlePropertyName: titleKey,
+        metadata,
+      };
+    });
+
+    res.json({
+      database: databaseName,
+      databaseId,
+      schema: schemaProperties,
+      pageCount: extracted.length,
+      pages: extracted,
+    });
+  } catch (error) {
+    const status = error.response?.status || 500;
+    res.status(status).json({
+      error: "Failed to fetch database",
+      detail: error.response?.data?.message || error.message,
+    });
   }
 });
 
